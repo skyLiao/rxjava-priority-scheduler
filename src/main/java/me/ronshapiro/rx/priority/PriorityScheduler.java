@@ -1,18 +1,19 @@
 package me.ronshapiro.rx.priority;
 
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import rx.Scheduler;
-import rx.Scheduler.Worker;
-import rx.Subscription;
-import rx.functions.Action0;
-import rx.internal.schedulers.ScheduledAction;
-import rx.subscriptions.CompositeSubscription;
-import rx.subscriptions.Subscriptions;
+import io.reactivex.Scheduler;
+import io.reactivex.annotations.NonNull;
+import io.reactivex.disposables.CompositeDisposable;
+import io.reactivex.disposables.Disposable;
+import io.reactivex.internal.schedulers.ScheduledRunnable;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
@@ -24,8 +25,7 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
  */
 public final class PriorityScheduler {
 
-    private final PriorityBlockingQueue<ComparableAction> queue =
-        new PriorityBlockingQueue<ComparableAction>();
+    private final PriorityBlockingQueue<ComparableRunnable> queue = new PriorityBlockingQueue<ComparableRunnable>();
     private final AtomicInteger workerCount = new AtomicInteger();
     private final int concurrency;
     private ExecutorService executorService;
@@ -33,7 +33,7 @@ public final class PriorityScheduler {
     /**
      * Creates a {@link PriorityScheduler} with as many threads as the machine's available
      * processors.
-     *
+     * <p>
      * <b>Note:</b> this does not ensure that the priorities will be adheared to exactly, as the
      * JVM's threading policy might allow one thread to dequeue an action, then let a second thread
      * dequeue the next action, run it, dequeue another, run it, etc. before the first thread runs
@@ -46,7 +46,7 @@ public final class PriorityScheduler {
 
     /**
      * Creates a {@link PriorityScheduler} using at most {@code concurrency} concurrent actions.
-     *
+     * <p>
      * <b>Note:</b> this does not ensure that the priorities will be adheared to exactly, as the
      * JVM's threading policy might allow one thread to dequeue an action, then let a second thread
      * dequeue the next action, run it, dequeue another, run it, etc. before the first thread runs
@@ -62,9 +62,17 @@ public final class PriorityScheduler {
         this.concurrency = concurrency;
     }
 
+    public static PriorityScheduler get() {
+        return Holder.INSTANCE;
+    }
+
+    private static class Holder {
+        static PriorityScheduler INSTANCE = create();
+    }
+
     /**
-     * Prioritize {@link rx.functions.Action action}s with a numerical priority value. The higher
-     * the priority, the sooner it will run.
+     * Prioritize {@link io.reactivex.functions.Action  action}s with a numerical priority
+     * value. The higher the priority, the sooner it will run.
      */
     public Scheduler priority(final int priority) {
         return new InnerPriorityScheduler(priority);
@@ -88,8 +96,8 @@ public final class PriorityScheduler {
                         public void run() {
                             while (true) {
                                 try {
-                                    ComparableAction action = queue.take();
-                                    action.call();
+                                    ComparableRunnable runnable = queue.take();
+                                    runnable.run();
                                 } catch (InterruptedException e) {
                                     Thread.currentThread().interrupt();
                                     break;
@@ -103,19 +111,19 @@ public final class PriorityScheduler {
         }
     }
 
-    private static final class PriorityWorker extends Worker {
+    private static final class PriorityWorker extends Scheduler.Worker {
 
-        private final CompositeSubscription compositeSubscription = new CompositeSubscription();
-        private final PriorityBlockingQueue<ComparableAction> queue;
+        private final CompositeDisposable compositeDisposable = new CompositeDisposable();
+        private final PriorityBlockingQueue<ComparableRunnable> queue;
         private final int priority;
 
-        private PriorityWorker(PriorityBlockingQueue<ComparableAction> queue, int priority) {
+        private PriorityWorker(PriorityBlockingQueue<ComparableRunnable> queue, int priority) {
             this.queue = queue;
             this.priority = priority;
         }
 
         @Override
-        public Subscription schedule(Action0 action) {
+        public Disposable schedule(Runnable action) {
             return schedule(action, 0, MILLISECONDS);
         }
 
@@ -125,52 +133,71 @@ public final class PriorityScheduler {
          * @see <a href="https://github.com/ReactiveX/RxAndroid/blob/53bc70785b1c8f150c2be871a5b85979ad8b233a/src/main/java/rx/android/schedulers/HandlerThreadScheduler.java">InnerHandlerThreadScheduler</a>
          */
         @Override
-        public Subscription schedule(Action0 action, long delayTime, TimeUnit unit) {
-            final ComparableAction comparableAction = new ComparableAction(action, priority);
+        public Disposable schedule(@NonNull Runnable run, long delayTime, @NonNull TimeUnit unit) {
+            final ComparableRunnable comparableRunnable = new ComparableRunnable(run, priority);
 
-            final ScheduledAction scheduledAction = new ScheduledAction(comparableAction);
-            scheduledAction.add(Subscriptions.create(new Action0() {
+            final ScheduledRunnable scheduledRunnable = new ScheduledRunnable(comparableRunnable, compositeDisposable);
+            scheduledRunnable.setFuture(new Future<Object>() {
                 @Override
-                public void call() {
-                    queue.remove(comparableAction);
+                public boolean cancel(boolean b) {
+                    return queue.remove(comparableRunnable);
                 }
-            }));
-            scheduledAction.addParent(compositeSubscription);
-            compositeSubscription.add(scheduledAction);
 
-            queue.offer(comparableAction, delayTime, unit);
-            return scheduledAction;
+                @Override
+                public boolean isCancelled() {
+                    return false;
+                }
+
+                @Override
+                public boolean isDone() {
+                    return false;
+                }
+
+                @Override
+                public Object get() throws InterruptedException, ExecutionException {
+                    return null;
+                }
+
+                @Override
+                public Object get(long l, @NonNull TimeUnit timeUnit) throws InterruptedException, ExecutionException, TimeoutException {
+                    return null;
+                }
+            });
+            compositeDisposable.add(scheduledRunnable);
+
+            queue.offer(comparableRunnable, delayTime, unit);
+            return scheduledRunnable;
         }
 
         @Override
-        public void unsubscribe() {
-            compositeSubscription.unsubscribe();
+        public void dispose() {
+            compositeDisposable.dispose();
         }
 
         @Override
-        public boolean isUnsubscribed() {
-            return compositeSubscription.isUnsubscribed();
+        public boolean isDisposed() {
+            return compositeDisposable.isDisposed();
         }
 
     }
 
-    private static final class ComparableAction implements Action0, Comparable<ComparableAction> {
+    private static final class ComparableRunnable implements Runnable, Comparable<ComparableRunnable> {
 
-        private final Action0 action;
+        private final Runnable runnable;
         private final int priority;
 
-        private ComparableAction(Action0 action, int priority) {
-            this.action = action;
+        private ComparableRunnable(Runnable runnable, int priority) {
+            this.runnable = runnable;
             this.priority = priority;
         }
 
         @Override
-        public void call() {
-            action.call();
+        public void run() {
+            runnable.run();
         }
 
         @Override
-        public int compareTo(ComparableAction o) {
+        public int compareTo(ComparableRunnable o) {
             return o.priority - priority;
         }
     }
